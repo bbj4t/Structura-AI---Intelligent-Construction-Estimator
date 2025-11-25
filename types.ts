@@ -78,6 +78,10 @@ export interface Project {
   dueDate: string;
   value: number;
   progress: number;
+  // New fields for persistence
+  templateId?: string;
+  items?: EstimationItem[];
+  lastUpdated?: string;
 }
 
 export interface ProjectTemplate {

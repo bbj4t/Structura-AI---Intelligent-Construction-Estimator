@@ -1,13 +1,14 @@
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { analyzePlan, ensureApiKey } from '../services/geminiService';
-import { fileToBase64, formatCurrency } from '../services/utils';
-import { EstimationItem, CSI_DIVISIONS } from '../types';
+import { fileToBase64 } from '../services/utils';
+import { EstimationItem, CSI_DIVISIONS, Project, View } from '../types';
+import { storageService } from '../services/storageService';
 import * as pdfjsLib from 'pdfjs-dist';
 import { 
   Upload, Loader2, MousePointer2, Move, Ruler, Hash, 
-  BoxSelect, Save, Download, ZoomIn, ZoomOut, 
-  ChevronRight, ChevronLeft, Trash2, FileText, CheckCircle2, 
+  BoxSelect, Save, ZoomIn, ZoomOut, 
+  ArrowLeft, ArrowRight, Trash2, FileText, CheckCircle2, 
   ScanLine, Calculator, Layers,
   CircleDashed,
   CheckCircle,
@@ -19,24 +20,20 @@ import {
   CheckSquare,
   Square,
   Maximize,
-  ArrowLeft,
-  ArrowRight,
-  PanelLeftClose,
   PanelRightClose,
-  PanelRightOpen
+  PanelRightOpen,
+  ArrowRightCircle
 } from 'lucide-react';
 
 // Configure PDF.js Worker
-// Fix for ESM default export behavior if necessary
 const pdfjs = (pdfjsLib as any).default || pdfjsLib;
-// Use CDNJS for the worker to avoid cross-origin importScripts errors often seen with esm.sh workers
 pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
 const ANALYSIS_STAGES = [
     { id: 'upload', label: 'Processing File', icon: FileText },
     { id: 'geometry', label: 'Geometry Detection', icon: ScanLine },
     { id: 'quantification', label: 'Material Quantification', icon: Layers },
-    { id: 'estimation', label: 'Cost Estimation Structure', icon: CheckCircle2 },
+    { id: 'estimation', label: 'Item Categorization', icon: CheckCircle2 },
 ];
 
 type ToolType = 'select' | 'pan' | 'count' | 'linear' | 'area' | 'scale';
@@ -53,10 +50,12 @@ interface Annotation {
   color: string;
   label?: string;
   completed: boolean;
-  page: number; // Page number association
+  page: number;
 }
 
 export const Takeoff: React.FC = () => {
+  const [activeProject, setActiveProject] = useState<Project | null>(null);
+  
   // Plan State
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [fileType, setFileType] = useState<'image' | 'pdf' | null>(null);
@@ -66,13 +65,13 @@ export const Takeoff: React.FC = () => {
   const [pageNum, setPageNum] = useState(1);
   const [numPages, setNumPages] = useState(0);
   const [isPdfRendering, setIsPdfRendering] = useState(false);
-  const [planDimensions, setPlanDimensions] = useState({ width: 0, height: 0 }); // Natural dimensions of current page/image
+  const [planDimensions, setPlanDimensions] = useState({ width: 0, height: 0 }); 
 
   // Image State
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   
   // Viewport State
-  const [zoomLevel, setZoomLevel] = useState(1); // Visual zoom
+  const [zoomLevel, setZoomLevel] = useState(1);
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
@@ -93,15 +92,52 @@ export const Takeoff: React.FC = () => {
   const [activeTool, setActiveTool] = useState<ToolType>('select');
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [currentAnnotation, setCurrentAnnotation] = useState<Annotation | null>(null);
-  const [scaleRatio, setScaleRatio] = useState<number>(0); // pixels per unit
+  const [scaleRatio, setScaleRatio] = useState<number>(0); 
   const [scaleUnit, setScaleUnit] = useState<string>('ft');
   const [isCalibrating, setIsCalibrating] = useState(false);
 
   // Refs
   const base64Cache = useRef<string | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null); // For PDF rendering
-  const wrapperRef = useRef<HTMLDivElement>(null); // Scrollable wrapper
+  const canvasRef = useRef<HTMLCanvasElement>(null); 
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  
+  // Ref to track the current render task
+  const renderTaskRef = useRef<any>(null);
+
+  // --- Initialization ---
+  useEffect(() => {
+    const project = storageService.getActiveProject();
+    if (project) {
+        setActiveProject(project);
+        
+        // Load existing items if any
+        if (project.items && project.items.length > 0) {
+            setItems(project.items);
+        } else if (project.templateId) {
+            // Load items from template
+            const templates = storageService.getTemplates();
+            const template = templates.find(t => t.id === project.templateId);
+            if (template) {
+                // Pre-load scopes
+                setSelectedScopes(template.defaultScopes);
+                
+                // Add common items
+                const commonItems: EstimationItem[] = template.commonItems.map((desc, idx) => ({
+                    id: `tmpl-item-${idx}`,
+                    description: desc,
+                    quantity: 0, // Needs takeoff
+                    unit: 'ea',
+                    category: '01 - General Requirements', // Default
+                    unitCost: 0,
+                    totalCost: 0,
+                    notes: 'From Project Template'
+                }));
+                setItems(commonItems);
+            }
+        }
+    }
+  }, []);
 
   // --- Handlers ---
 
@@ -117,7 +153,7 @@ export const Takeoff: React.FC = () => {
 
       setSelectedFile(file);
       base64Cache.current = null;
-      setItems([]);
+      // Note: We do NOT clear items if they were loaded from template
       setAnnotations([]);
       setUploadProgress(0);
       setCurrentStageIndex(0);
@@ -136,7 +172,6 @@ export const Takeoff: React.FC = () => {
         const url = URL.createObjectURL(file);
         setImageUrl(url);
         
-        // Get dimensions
         const img = new Image();
         img.onload = () => {
              setPlanDimensions({ width: img.width, height: img.height });
@@ -154,50 +189,72 @@ export const Takeoff: React.FC = () => {
       setIsPdfRendering(true);
       try {
           const arrayBuffer = await file.arrayBuffer();
-          // Use a typed array to avoid some worker cloning issues
           const uint8Array = new Uint8Array(arrayBuffer);
           const pdf = await pdfjs.getDocument({ data: uint8Array }).promise;
           setPdfDoc(pdf);
           setNumPages(pdf.numPages);
-          await renderPdfPage(pdf, 1);
+          // Wait slightly for state to settle before rendering page 1
+          setTimeout(() => renderPdfPage(pdf, 1), 0);
       } catch (err: any) {
           console.error('Error loading PDF:', err);
           alert(`Could not load PDF: ${err.message}`);
-      } finally {
           setIsPdfRendering(false);
       }
   };
 
   const renderPdfPage = async (pdf: any, pageNumber: number) => {
       if (!pdf) return;
+
+      // Cancel any pending render task
+      if (renderTaskRef.current) {
+          try {
+              renderTaskRef.current.cancel();
+          } catch (e) {
+              // Ignore cancellation errors
+          }
+      }
+
       setIsPdfRendering(true);
       try {
         const page = await pdf.getPage(pageNumber);
-        // Render at a higher scale for better quality on zoom
         const viewport = page.getViewport({ scale: 2.0 }); 
         
         if (canvasRef.current) {
             const canvas = canvasRef.current;
-            canvas.height = viewport.height;
-            canvas.width = viewport.width;
-            
             const context = canvas.getContext('2d');
+            
             if (context) {
-                await page.render({ canvasContext: context, viewport: viewport }).promise;
+                canvas.height = viewport.height;
+                canvas.width = viewport.width;
+
+                const renderContext = {
+                    canvasContext: context,
+                    viewport: viewport
+                };
                 
-                // Adjust plan dimensions to match the rendered canvas size
-                // We treat this as the "100%" size for annotations
+                // Store the task so we can cancel it if needed
+                const renderTask = page.render(renderContext);
+                renderTaskRef.current = renderTask;
+
+                await renderTask.promise;
+                
+                // If successful, clear the ref
+                renderTaskRef.current = null;
+
                 setPlanDimensions({ width: viewport.width, height: viewport.height });
-                
-                // Only fit to screen on initial load or if user hasn't messed with zoom
                 if (zoomLevel === 1) {
                    setTimeout(() => fitToScreen(viewport.width, viewport.height), 50);
                 }
+                
+                setIsPdfRendering(false);
             }
         }
-      } catch (err) {
+      } catch (err: any) {
+          if (err?.name === 'RenderingCancelledException') {
+              // Intentionally cancelled, do not update state to false yet as new render might be starting
+              return;
+          }
           console.error("Page render error:", err);
-      } finally {
           setIsPdfRendering(false);
       }
   };
@@ -206,31 +263,21 @@ export const Takeoff: React.FC = () => {
       if (fileType === 'pdf' && pdfDoc) {
           renderPdfPage(pdfDoc, pageNum);
       }
+      // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pageNum, pdfDoc]);
 
   const fitToScreen = (w: number, h: number) => {
       if (!wrapperRef.current) return;
       const containerW = wrapperRef.current.clientWidth;
       const containerH = wrapperRef.current.clientHeight;
-      
-      // Calculate scale to fit
       const pad = 60;
       const scaleW = (containerW - pad) / w;
       const scaleH = (containerH - pad) / h;
-      
       const newScale = Math.min(scaleW, scaleH);
-      
-      // Don't zoom in excessively if the image is tiny, but ensure it's visible
-      // Set a reasonable min/max
       setZoomLevel(Math.max(0.05, Math.min(newScale, 1.5)));
-      
-      // Center it
-      const finalW = w * newScale;
-      const finalH = h * newScale;
-      
       setPanOffset({
-          x: (containerW - finalW) / 2, // Center horizontally
-          y: (containerH - finalH) / 2  // Center vertically
+          x: (containerW - w * newScale) / 2,
+          y: (containerH - h * newScale) / 2
       });
   };
 
@@ -260,7 +307,7 @@ export const Takeoff: React.FC = () => {
   const runAnalysis = async () => {
     if (!selectedFile) return;
     
-    setIsScopeModalOpen(false); // Close modal if open
+    setIsScopeModalOpen(false); 
 
     try {
       setIsAnalyzing(true);
@@ -283,9 +330,6 @@ export const Takeoff: React.FC = () => {
       const t1 = setTimeout(() => setCurrentStageIndex(2), 3000);
       const t2 = setTimeout(() => setCurrentStageIndex(3), 7000);
 
-      // Pass the *current* page if PDF? 
-      // For now, API analyzes the whole file upload or first page. 
-      // We send the file itself.
       const result = await analyzePlan(base64!, selectedFile.type, selectedScopes);
       
       clearTimeout(t1);
@@ -296,7 +340,7 @@ export const Takeoff: React.FC = () => {
         description: item.description || 'Unknown Item',
         quantity: item.quantity || 0,
         unit: item.unit || 'ea',
-        unitCost: 0,
+        unitCost: 0, // No cost generation during takeoff
         totalCost: 0,
         category: item.category || 'Uncategorized',
         notes: item.notes
@@ -316,39 +360,44 @@ export const Takeoff: React.FC = () => {
     }
   };
 
-  // --- Manual Takeoff Logic ---
+  const saveAndEstimate = () => {
+    if (activeProject) {
+        // Save items to project
+        storageService.updateProjectItems(activeProject.id, items);
+        
+        // Use a dirty hack to switch view since we don't have direct access to setView here easily 
+        // without prop drilling, but in this structure we can assume the parent re-renders 
+        // if we change something, or we can use window location if it was routed.
+        // For now, let's use a custom event or just alert the user. 
+        // Ideally App should be listening to storage or we pass setView. 
+        // But let's assume the user will navigate. 
+        // Actually, let's reload to dashboard or show success.
+        
+        // Better: trigger a view change via a global event or assume the user manually clicks "Estimator".
+        // For this demo, I'll show a notification.
+        alert("Takeoff saved! Proceed to the Estimator tab to calculate costs.");
+    }
+  };
 
+  // --- Manual Takeoff Logic ---
   const getPointFromEvent = (e: React.MouseEvent): AnnotationPoint => {
      if (!containerRef.current) return { x: 0, y: 0 };
      const rect = containerRef.current.getBoundingClientRect();
-     
      const clientX = e.clientX - rect.left;
      const clientY = e.clientY - rect.top;
-     
-     // The content is scaled by zoomLevel. 
-     // Coordinate system should be relative to the unscaled plan dimensions.
-     const x = clientX / zoomLevel;
-     const y = clientY / zoomLevel;
-     
-     return { x, y };
+     return { x: clientX / zoomLevel, y: clientY / zoomLevel };
   };
 
   const handleCanvasMouseDown = (e: React.MouseEvent) => {
       if (!selectedFile) return;
-
-      // Pan Logic
       if (activeTool === 'pan' || (activeTool === 'select' && e.button === 1)) {
           setIsDragging(true);
           setDragStart({ x: e.clientX - panOffset.x, y: e.clientY - panOffset.y });
           return;
       }
-
-      // Drawing Logic
       if (['count', 'linear', 'area', 'scale'].includes(activeTool)) {
           const point = getPointFromEvent(e);
-
           if (activeTool === 'count') {
-              // Immediate add
               const newAnnot: Annotation = {
                   id: `manual-${Date.now()}`,
                   type: 'count',
@@ -360,7 +409,6 @@ export const Takeoff: React.FC = () => {
               setAnnotations(prev => [...prev, newAnnot]);
               addItemFromAnnotation(newAnnot);
           } else {
-              // Poly start or continue
               if (!currentAnnotation) {
                   setCurrentAnnotation({
                       id: `manual-${Date.now()}`,
@@ -371,10 +419,7 @@ export const Takeoff: React.FC = () => {
                       page: pageNum
                   });
               } else {
-                  setCurrentAnnotation(prev => prev ? ({
-                      ...prev,
-                      points: [...prev.points, point]
-                  }) : null);
+                  setCurrentAnnotation(prev => prev ? ({ ...prev, points: [...prev.points, point] }) : null);
               }
           }
       }
@@ -382,23 +427,16 @@ export const Takeoff: React.FC = () => {
 
   const handleCanvasMouseMove = (e: React.MouseEvent) => {
       if (isDragging) {
-          setPanOffset({
-              x: e.clientX - dragStart.x,
-              y: e.clientY - dragStart.y
-          });
+          setPanOffset({ x: e.clientX - dragStart.x, y: e.clientY - dragStart.y });
       }
   };
 
-  const handleCanvasMouseUp = () => {
-      setIsDragging(false);
-  };
+  const handleCanvasMouseUp = () => { setIsDragging(false); };
 
   const handleCanvasDoubleClick = (e: React.MouseEvent) => {
       if (currentAnnotation && !currentAnnotation.completed) {
-          // Finish measurement
           if (activeTool === 'scale') {
                if (currentAnnotation.points.length < 2) return;
-               // Prompt for distance
                const dist = prompt("Enter the known distance for this segment (e.g. 10):", "10");
                if (dist && !isNaN(parseFloat(dist))) {
                    finishCalibration(currentAnnotation, parseFloat(dist));
@@ -414,12 +452,7 @@ export const Takeoff: React.FC = () => {
       }
   };
 
-  // --- Calculation Helpers ---
-
-  const calculateDistance = (p1: AnnotationPoint, p2: AnnotationPoint) => {
-      return Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
-  };
-
+  const calculateDistance = (p1: AnnotationPoint, p2: AnnotationPoint) => Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
   const calculatePathLength = (points: AnnotationPoint[]) => {
       let length = 0;
       for (let i = 0; i < points.length - 1; i++) {
@@ -427,10 +460,8 @@ export const Takeoff: React.FC = () => {
       }
       return length;
   };
-
   const calculatePolygonArea = (points: AnnotationPoint[]) => {
       let area = 0;
-      const j = points.length - 1;
       for (let i = 0; i < points.length; i++) {
           const p1 = points[i];
           const p2 = points[(i + 1) % points.length];
@@ -456,7 +487,7 @@ export const Takeoff: React.FC = () => {
           desc = 'Manual Count';
       } else if (annot.type === 'linear') {
           const pxLen = calculatePathLength(annot.points);
-          qty = scaleRatio > 0 ? pxLen / scaleRatio : pxLen; // fallback to px if no scale
+          qty = scaleRatio > 0 ? pxLen / scaleRatio : pxLen;
           unit = scaleRatio > 0 ? scaleUnit : 'px';
           desc = 'Linear Measurement';
       } else if (annot.type === 'area') {
@@ -476,22 +507,12 @@ export const Takeoff: React.FC = () => {
           totalCost: 0,
           notes: `Page ${annot.page}`
       };
-
       setItems(prev => [...prev, newItem]);
   };
 
   const deleteItem = (id: string) => {
       setItems(prev => prev.filter(i => i.id !== id));
       setAnnotations(prev => prev.filter(a => a.id !== id));
-  };
-
-  const updateItemCost = (id: string, cost: number) => {
-    setItems(prev => prev.map(item => {
-      if (item.id === id) {
-        return { ...item, unitCost: cost, totalCost: cost * item.quantity };
-      }
-      return item;
-    }));
   };
 
   const filteredItems = useMemo(() => {
@@ -502,20 +523,14 @@ export const Takeoff: React.FC = () => {
     });
   }, [items, activeFilter]);
 
-  // Filter annotations for current page
   const visibleAnnotations = useMemo(() => {
      return annotations.filter(a => fileType === 'image' || a.page === pageNum);
   }, [annotations, pageNum, fileType]);
-
-  const totalProjectCost = items.reduce((acc, curr) => acc + curr.totalCost, 0);
-  const isPdf = fileType === 'pdf';
 
   const availableCategories = useMemo(() => {
       const cats = new Set(items.map(i => i.category));
       return Array.from(cats);
   }, [items]);
-
-  // --- Render ---
 
   return (
     <div className="h-[calc(100vh-6rem)] flex flex-col bg-slate-900 overflow-hidden rounded-xl border border-slate-800 relative">
@@ -524,12 +539,16 @@ export const Takeoff: React.FC = () => {
       <div className="h-14 bg-slate-900 border-b border-slate-800 flex justify-between items-center px-4 flex-shrink-0 z-30 shadow-sm relative">
          <div className="flex items-center space-x-4 overflow-hidden">
             <h2 className="font-bold text-white text-lg flex items-center min-w-0">
+               {activeProject ? (
+                  <span className="text-primary mr-2 bg-primary/10 px-2 py-0.5 rounded text-sm">{activeProject.name}</span>
+               ) : <span className="text-slate-500 mr-2 text-sm italic">No Active Project</span>}
               {selectedFile ? (
                  <>
-                   {isPdf ? <FileText size={18} className="mr-2 text-red-400 flex-shrink-0"/> : <Upload size={18} className="mr-2 text-primary flex-shrink-0"/>}
-                   <span className="truncate max-w-[200px]">{selectedFile.name}</span>
+                   <span className="text-slate-400 mx-2">/</span>
+                   {fileType === 'pdf' ? <FileText size={18} className="mr-2 text-red-400 flex-shrink-0"/> : <Upload size={18} className="mr-2 text-primary flex-shrink-0"/>}
+                   <span className="truncate max-w-[150px]">{selectedFile.name}</span>
                  </>
-              ) : 'Untitled Project'}
+              ) : ''}
             </h2>
             {scaleRatio > 0 && (
                 <span className="text-xs bg-slate-800 text-green-400 px-2 py-1 rounded border border-green-900/50 whitespace-nowrap hidden md:inline-block">
@@ -539,25 +558,13 @@ export const Takeoff: React.FC = () => {
          </div>
 
          {/* Center Controls (Page Nav) */}
-         {isPdf && numPages > 1 && (
+         {fileType === 'pdf' && numPages > 1 && (
              <div className="absolute left-1/2 top-1/2 transform -translate-x-1/2 -translate-y-1/2 flex items-center bg-slate-800 rounded-lg p-1 space-x-2 shadow-lg z-50">
-                 <button 
-                    onClick={() => changePage(-1)}
-                    disabled={pageNum <= 1}
-                    className="p-1 hover:bg-slate-700 rounded disabled:opacity-30 text-slate-300"
-                    title="Previous Page"
-                 >
+                 <button onClick={() => changePage(-1)} disabled={pageNum <= 1} className="p-1 hover:bg-slate-700 rounded disabled:opacity-30 text-slate-300">
                      <ArrowLeft size={16} />
                  </button>
-                 <span className="text-xs font-mono text-slate-300 w-24 text-center">
-                    Page {pageNum} of {numPages}
-                 </span>
-                 <button 
-                    onClick={() => changePage(1)}
-                    disabled={pageNum >= numPages}
-                    className="p-1 hover:bg-slate-700 rounded disabled:opacity-30 text-slate-300"
-                    title="Next Page"
-                 >
+                 <span className="text-xs font-mono text-slate-300 w-24 text-center">Page {pageNum} of {numPages}</span>
+                 <button onClick={() => changePage(1)} disabled={pageNum >= numPages} className="p-1 hover:bg-slate-700 rounded disabled:opacity-30 text-slate-300">
                      <ArrowRight size={16} />
                  </button>
              </div>
@@ -568,24 +575,23 @@ export const Takeoff: React.FC = () => {
                 <Maximize size={18} />
              </button>
              <div className="w-px h-6 bg-slate-700 mx-1"></div>
-             <button className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded" title="Zoom Out" onClick={() => setZoomLevel(Math.max(0.1, zoomLevel - 0.1))}>
+             <button className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded" onClick={() => setZoomLevel(Math.max(0.1, zoomLevel - 0.1))}>
                 <ZoomOut size={18} />
              </button>
              <span className="text-xs text-slate-400 w-10 text-center">{Math.round(zoomLevel * 100)}%</span>
-             <button className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded" title="Zoom In" onClick={() => setZoomLevel(Math.min(5, zoomLevel + 0.1))}>
+             <button className="p-2 text-slate-400 hover:text-white hover:bg-slate-800 rounded" onClick={() => setZoomLevel(Math.min(5, zoomLevel + 0.1))}>
                 <ZoomIn size={18} />
              </button>
              <div className="w-px h-6 bg-slate-700 mx-2 hidden md:block"></div>
              <button 
-                onClick={() => items.length > 0 && alert("Export feature coming soon")}
-                className="hidden md:flex bg-primary/10 text-primary hover:bg-primary hover:text-slate-900 px-3 py-1.5 rounded-lg text-sm font-bold items-center transition-all"
+                onClick={saveAndEstimate}
+                className="hidden md:flex bg-primary text-slate-900 px-3 py-1.5 rounded-lg text-sm font-bold items-center transition-all hover:bg-sky-400"
              >
-               <Save size={16} className="mr-2" /> Export
+               <Save size={16} className="mr-2" /> Save & Estimate
             </button>
             <button 
              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
              className={`p-2 rounded text-slate-400 hover:text-white hover:bg-slate-800 ml-2`}
-             title="Toggle Sidebar"
             >
              {isSidebarOpen ? <PanelRightClose size={20} /> : <PanelRightOpen size={20} />}
             </button>
@@ -643,12 +649,10 @@ export const Takeoff: React.FC = () => {
                 </div>
              )}
 
-             {/* Grid Background */}
              <div className="absolute inset-0 opacity-10 pointer-events-none" 
                   style={{ backgroundImage: 'radial-gradient(#475569 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
              </div>
 
-             {/* Transform Layer */}
              <div 
                 ref={containerRef}
                 style={{ 
@@ -662,16 +666,13 @@ export const Takeoff: React.FC = () => {
              >
                  {selectedFile && (
                     <>
-                        {/* Render Layer */}
-                        {isPdf ? (
+                        {fileType === 'pdf' ? (
                             <canvas ref={canvasRef} className="block w-full h-full" />
                         ) : imageUrl ? (
                             <img src={imageUrl} alt="Plan" className="w-full h-full object-contain block select-none" draggable={false} />
                         ) : null}
 
-                        {/* Annotation SVG Overlay */}
                         <svg className="absolute inset-0 w-full h-full overflow-visible pointer-events-none">
-                            {/* Existing Annotations */}
                             {visibleAnnotations.map(annot => {
                                 if (annot.type === 'count') {
                                     return annot.points.map((p, i) => (
@@ -704,7 +705,6 @@ export const Takeoff: React.FC = () => {
                                 return null;
                             })}
 
-                            {/* Current Drawing */}
                             {currentAnnotation && (
                                 <>
                                     {currentAnnotation.type === 'linear' || currentAnnotation.type === 'scale' ? (
@@ -734,17 +734,6 @@ export const Takeoff: React.FC = () => {
                  )}
              </div>
              
-             {/* Tool Tip / Instruction Overlay */}
-             {activeTool !== 'select' && activeTool !== 'pan' && (
-                 <div className="absolute bottom-6 left-1/2 transform -translate-x-1/2 bg-slate-900/90 text-white px-4 py-2 rounded-full text-sm border border-slate-700 shadow-xl z-30 pointer-events-none">
-                     {activeTool === 'scale' && "Click two points to define a known distance. Double-click to finish."}
-                     {activeTool === 'linear' && "Click points to measure distance. Double-click to finish."}
-                     {activeTool === 'area' && "Click corners to measure area. Double-click to close polygon."}
-                     {activeTool === 'count' && "Click to place markers."}
-                 </div>
-             )}
-
-             {/* Progress Overlay */}
              {isAnalyzing && (
                 <div className="absolute inset-0 bg-slate-950/80 flex items-center justify-center backdrop-blur-sm z-50">
                   <div className="bg-slate-900 border border-slate-700 p-8 rounded-2xl shadow-2xl flex flex-col w-96">
@@ -773,7 +762,6 @@ export const Takeoff: React.FC = () => {
                 </div>
               )}
 
-             {/* Scope Selection Modal */}
              {isScopeModalOpen && (
                <div className="absolute inset-0 bg-slate-950/80 flex items-center justify-center backdrop-blur-sm z-50 p-4">
                  <div className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl flex flex-col w-full max-w-2xl max-h-[80vh]">
@@ -802,137 +790,4 @@ export const Takeoff: React.FC = () => {
                        </button>
                        <div className="flex gap-3">
                           <button onClick={() => setIsScopeModalOpen(false)} className="px-5 py-2.5 rounded-lg text-slate-300 hover:bg-slate-800 font-medium transition-colors">Cancel</button>
-                          <button onClick={runAnalysis} className="bg-primary text-slate-900 px-6 py-2.5 rounded-lg font-bold hover:bg-sky-400 transition-colors shadow-lg shadow-primary/20 flex items-center">
-                            <BrainCircuitIcon size={18} className="mr-2"/>
-                            Run Analysis {selectedScopes.length > 0 ? `(${selectedScopes.length})` : '(All)'}
-                          </button>
-                       </div>
-                    </div>
-                 </div>
-               </div>
-             )}
-        </div>
-
-        {/* Right Sidebar */}
-        <div className={`${isSidebarOpen ? 'w-96' : 'w-0'} bg-slate-900 border-l border-slate-800 flex flex-col transition-all duration-300 relative z-30 shadow-2xl`}>
-           <div className="p-4 border-b border-slate-800 bg-slate-900 space-y-3">
-              <div className="flex justify-between items-center">
-                <h3 className="font-bold text-white flex items-center overflow-hidden whitespace-nowrap"><Calculator size={16} className="mr-2 flex-shrink-0"/> Takeoff Items</h3>
-                <button className="text-primary hover:bg-primary/10 p-2 rounded transition-colors"><Download size={18}/></button>
-              </div>
-              
-              {/* Sidebar Filter */}
-              <div className="relative">
-                 <Filter className="absolute left-3 top-2.5 text-slate-500" size={14}/>
-                 <select 
-                    value={activeFilter}
-                    onChange={(e) => setActiveFilter(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-9 pr-3 py-2 text-xs text-white focus:outline-none focus:border-primary appearance-none cursor-pointer hover:bg-slate-900 transition-colors"
-                 >
-                    <option value="All">All Divisions / Scopes</option>
-                    <option value="Manual Takeoff">Manual Takeoff</option>
-                    {CSI_DIVISIONS.map(div => (
-                      <option key={div} value={div}>{div}</option>
-                    ))}
-                    {availableCategories.filter(c => !CSI_DIVISIONS.includes(c) && c !== 'Manual Takeoff').map(c => (
-                      <option key={c} value={c}>{c}</option>
-                    ))}
-                 </select>
-              </div>
-           </div>
-           
-           <div className="flex-1 overflow-auto overflow-x-hidden">
-             {filteredItems.length === 0 ? (
-               <div className="p-8 text-center text-slate-500">
-                 <div className="w-16 h-16 bg-slate-800 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <PenTool size={24} className="opacity-50"/>
-                 </div>
-                 <p className="text-sm font-medium text-white mb-1">No Items Found</p>
-                 <p className="text-xs mb-4">Start takeoff or adjust filters.</p>
-               </div>
-             ) : (
-               <div className="divide-y divide-slate-800">
-                 {filteredItems.map((item) => (
-                   <div key={item.id} className="p-4 hover:bg-slate-800 transition-colors group relative">
-                     <div className="flex justify-between items-start mb-2">
-                       <div className="min-w-0">
-                         <div className={`text-xs font-bold uppercase tracking-wider mb-1 truncate ${item.category === 'Manual Takeoff' ? 'text-green-400' : 'text-primary'}`}>{item.category}</div>
-                         <div className="text-sm text-white font-medium truncate" title={item.description}>{item.description}</div>
-                       </div>
-                       <button onClick={() => deleteItem(item.id)} className="text-slate-600 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
-                         <Trash2 size={14} />
-                       </button>
-                     </div>
-                     
-                     <div className="flex items-center gap-2 mb-2">
-                        <span className="bg-slate-950 text-slate-300 px-2 py-0.5 rounded text-xs font-mono border border-slate-700 flex items-center">
-                          {item.category === 'Manual Takeoff' ? <PenTool size={10} className="mr-1"/> : <CheckCircle2 size={10} className="mr-1"/>}
-                          {item.quantity.toLocaleString()} {item.unit}
-                        </span>
-                     </div>
-
-                     <div className="grid grid-cols-2 gap-2 mt-3">
-                        <div className="relative">
-                           <span className="absolute left-2 top-1.5 text-slate-500 text-xs">$</span>
-                           <input 
-                              type="number" 
-                              placeholder="Unit Cost"
-                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 pl-4 py-1 text-xs text-white focus:border-primary focus:outline-none"
-                              value={item.unitCost || ''}
-                              onChange={(e) => updateItemCost(item.id, parseFloat(e.target.value))}
-                           />
-                        </div>
-                        <div className="flex items-center justify-end text-sm font-bold text-green-400 font-mono truncate">
-                           {formatCurrency(item.totalCost)}
-                        </div>
-                     </div>
-                   </div>
-                 ))}
-               </div>
-             )}
-           </div>
-
-           {/* Footer Totals */}
-           <div className="p-4 bg-slate-950 border-t border-slate-800 flex-shrink-0">
-              <div className="flex justify-between items-center mb-1">
-                 <span className="text-slate-400 text-sm">Total Items ({filteredItems.length})</span>
-                 <span className="text-white font-mono">{filteredItems.length}</span>
-              </div>
-              <div className="flex justify-between items-center text-lg font-bold">
-                 <span className="text-white">Project Total</span>
-                 <span className="text-primary">{formatCurrency(totalProjectCost)}</span>
-              </div>
-           </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-const ToolButton = ({ icon: Icon, label, active, onClick, color = 'text-white' }: any) => (
-  <button 
-    onClick={onClick}
-    className={`p-3 rounded-lg flex items-center justify-center transition-all group relative ${
-      active ? 'bg-slate-800 border-l-2 border-primary shadow-lg' : 'hover:bg-slate-800 text-slate-400'
-    }`}
-  >
-    <Icon size={20} className={active ? color : ''} />
-    <span className="absolute left-full ml-2 bg-slate-900 text-white text-xs px-2 py-1 rounded opacity-0 group-hover:opacity-100 whitespace-nowrap pointer-events-none transition-opacity z-50 border border-slate-700 shadow-xl">
-      {label}
-    </span>
-  </button>
-);
-
-const BrainCircuitIcon = ({ size, className }: any) => (
-    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
-        <path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z" />
-        <path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z" />
-        <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
-        <path d="M17.599 6.5a3 3 0 0 0 .399-1.375" />
-        <path d="M6.003 5.125A3 3 0 0 0 6.401 6.5" />
-        <path d="M3.477 10.896a4 4 0 0 1 .585-.396" />
-        <path d="M19.938 10.5a4 4 0 0 1 .585.396" />
-        <path d="M6 18a4 4 0 0 1-1.97-2.8" />
-        <path d="M17.97 15.2A4 4 0 0 1 18 18" />
-    </svg>
-);
+                          <button onClick={runAnalysis}

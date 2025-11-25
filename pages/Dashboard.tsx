@@ -1,7 +1,8 @@
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { View, Project, ProjectTemplate, CSI_DIVISIONS } from '../types';
-import { Plus, ArrowRight, Search, Folder, MoreVertical, Calendar, DollarSign, PieChart, LayoutTemplate, Trash2, Check, X, CheckSquare, Square, Save } from 'lucide-react';
+import { storageService } from '../services/storageService';
+import { Plus, ArrowRight, Search, Folder, MoreVertical, Calendar, DollarSign, PieChart, LayoutTemplate, Trash2, Check, X, CheckSquare, Square, Save, FilePlus } from 'lucide-react';
 import { formatCurrency } from '../services/utils';
 
 interface DashboardProps {
@@ -52,37 +53,71 @@ const ProjectRow: React.FC<{ project: Project; onClick: () => void }> = ({ proje
 );
 
 export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
-  const [projects] = useState<Project[]>([
-    { id: '1', name: 'Lakeside Office Complex', address: '1200 Riverside Dr, Austin, TX', status: 'In Progress', dueDate: 'Oct 24, 2025', value: 4500000, progress: 35 },
-    { id: '2', name: 'Downtown Renovation', address: '400 Main St, Chicago, IL', status: 'Bidding', dueDate: 'Nov 01, 2025', value: 1200000, progress: 10 },
-    { id: '3', name: 'Westside Apartments', address: '890 Pine Ave, Seattle, WA', status: 'Won', dueDate: 'Sep 15, 2025', value: 8750000, progress: 0 },
-    { id: '4', name: 'Harbor Retail Center', address: '55 Ocean Blvd, Miami, FL', status: 'Lost', dueDate: 'Aug 30, 2025', value: 3200000, progress: 100 },
-  ]);
-
-  // Template Management State
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
+  
+  // UI States
   const [showTemplateModal, setShowTemplateModal] = useState(false);
-  const [templates, setTemplates] = useState<ProjectTemplate[]>([
-    {
-      id: 'default-1',
-      name: 'Commercial Office Shell',
-      description: 'Standard setup for office shell & core projects. Focus on concrete, steel, and exterior framing.',
-      defaultScopes: ['03 - Concrete', '04 - Masonry', '05 - Metals', '08 - Openings'],
-      commonItems: ['3000psi Concrete Slab', 'Steel Columns W12x40', 'Exterior Glazing System']
-    },
-    {
-      id: 'default-2',
-      name: 'Residential Interior',
-      description: 'Interior renovation template for multi-family units.',
-      defaultScopes: ['09 - Finishes', '06 - Wood, Plastics, Composites', '08 - Openings', '12 - Furnishings'],
-      commonItems: ['5/8" Drywall Type X', 'Interior Paint (Eggshell)', 'LVT Flooring', 'Baseboard 4"']
-    }
-  ]);
+  const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  
+  // New Project Form
+  const [newProjectName, setNewProjectName] = useState('');
+  const [newProjectAddress, setNewProjectAddress] = useState('');
+  const [selectedTemplateForProject, setSelectedTemplateForProject] = useState<string>('');
 
+  // Template Editing State
   const [selectedTemplateId, setSelectedTemplateId] = useState<string | null>(null);
   const [templateForm, setTemplateForm] = useState<ProjectTemplate>({
     id: '', name: '', description: '', defaultScopes: [], commonItems: []
   });
   const [newItemText, setNewItemText] = useState('');
+
+  // Initial Load
+  useEffect(() => {
+    setTemplates(storageService.getTemplates());
+    const savedProjects = storageService.getProjects();
+    
+    // Seed some projects if empty
+    if (savedProjects.length === 0) {
+      const seedProjects: Project[] = [
+        { id: '1', name: 'Lakeside Office Complex', address: '1200 Riverside Dr, Austin, TX', status: 'In Progress', dueDate: 'Oct 24, 2025', value: 4500000, progress: 35, items: [] },
+        { id: '2', name: 'Downtown Renovation', address: '400 Main St, Chicago, IL', status: 'Bidding', dueDate: 'Nov 01, 2025', value: 1200000, progress: 10, items: [] },
+      ];
+      seedProjects.forEach(p => storageService.saveProject(p));
+      setProjects(seedProjects);
+    } else {
+      setProjects(savedProjects);
+    }
+  }, []);
+
+  const handleOpenProject = (project: Project) => {
+    storageService.setActiveProjectId(project.id);
+    setView(View.TAKEOFF);
+  };
+
+  const handleCreateProject = () => {
+    if (!newProjectName) return;
+    
+    const newProject: Project = {
+        id: `proj-${Date.now()}`,
+        name: newProjectName,
+        address: newProjectAddress || 'TBD',
+        status: 'Bidding',
+        dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toLocaleDateString(),
+        value: 0,
+        progress: 0,
+        items: [],
+        templateId: selectedTemplateForProject || undefined
+    };
+
+    storageService.saveProject(newProject);
+    storageService.setActiveProjectId(newProject.id);
+    setProjects(prev => [...prev, newProject]);
+    setShowNewProjectModal(false);
+    setView(View.TAKEOFF);
+  };
+
+  // --- Template Handlers ---
 
   const handleOpenTemplates = () => {
     setShowTemplateModal(true);
@@ -139,20 +174,24 @@ export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
   const saveTemplate = () => {
     if (!templateForm.name) return;
     
-    setTemplates(prev => {
-      const exists = prev.find(t => t.id === templateForm.id);
-      if (exists) {
-        return prev.map(t => t.id === templateForm.id ? templateForm : t);
-      } else {
-        return [...prev, templateForm];
-      }
-    });
+    const updatedTemplates = [...templates];
+    const existsIndex = updatedTemplates.findIndex(t => t.id === templateForm.id);
+    
+    if (existsIndex >= 0) {
+      updatedTemplates[existsIndex] = templateForm;
+    } else {
+      updatedTemplates.push(templateForm);
+    }
+    
+    setTemplates(updatedTemplates);
+    storageService.saveTemplates(updatedTemplates);
     setSelectedTemplateId(templateForm.id);
   };
 
   const deleteTemplate = (id: string) => {
     const newTemplates = templates.filter(t => t.id !== id);
     setTemplates(newTemplates);
+    storageService.saveTemplates(newTemplates);
     if (newTemplates.length > 0) {
       selectTemplate(newTemplates[0]);
     } else {
@@ -167,7 +206,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
         <div className="bg-slate-900 p-6 rounded-xl border border-slate-800 flex items-center justify-between">
            <div>
              <p className="text-slate-400 text-sm font-medium mb-1">Total Pipeline</p>
-             <h2 className="text-2xl font-bold text-white">$17.6M</h2>
+             <h2 className="text-2xl font-bold text-white">{formatCurrency(projects.reduce((acc, p) => acc + p.value, 0))}</h2>
            </div>
            <div className="w-12 h-12 bg-primary/10 rounded-full flex items-center justify-center text-primary">
              <DollarSign size={24} />
@@ -176,7 +215,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
         <div className="bg-slate-900 p-6 rounded-xl border border-slate-800 flex items-center justify-between">
            <div>
              <p className="text-slate-400 text-sm font-medium mb-1">Active Bids</p>
-             <h2 className="text-2xl font-bold text-white">12</h2>
+             <h2 className="text-2xl font-bold text-white">{projects.filter(p => p.status === 'Bidding').length}</h2>
            </div>
            <div className="w-12 h-12 bg-yellow-500/10 rounded-full flex items-center justify-center text-yellow-400">
              <PieChart size={24} />
@@ -218,7 +257,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
            </button>
 
            <button 
-            onClick={() => setView(View.TAKEOFF)}
+            onClick={() => {
+                setNewProjectName('');
+                setNewProjectAddress('');
+                setSelectedTemplateForProject('');
+                setShowNewProjectModal(true);
+            }}
             className="bg-primary hover:bg-sky-400 text-slate-900 px-4 py-2 rounded-lg flex items-center font-bold shadow-lg shadow-primary/20 transition-all whitespace-nowrap"
           >
             <Plus size={18} className="mr-2" /> New Project
@@ -240,20 +284,79 @@ export const Dashboard: React.FC<DashboardProps> = ({ setView }) => {
               </tr>
             </thead>
             <tbody>
-              {projects.map(p => (
-                <ProjectRow key={p.id} project={p} onClick={() => setView(View.TAKEOFF)} />
-              ))}
+              {projects.length > 0 ? projects.map(p => (
+                <ProjectRow key={p.id} project={p} onClick={() => handleOpenProject(p)} />
+              )) : (
+                 <tr>
+                    <td colSpan={6} className="text-center py-10 text-slate-500">No projects found. Create one to get started.</td>
+                 </tr>
+              )}
             </tbody>
           </table>
         </div>
-        <div className="p-4 border-t border-slate-800 flex justify-between items-center text-xs text-slate-500 bg-slate-950">
-          <span>Showing 4 of 12 projects</span>
-          <div className="flex gap-2">
-            <button className="px-3 py-1 bg-slate-900 rounded border border-slate-800 hover:text-white">Previous</button>
-            <button className="px-3 py-1 bg-slate-900 rounded border border-slate-800 hover:text-white">Next</button>
-          </div>
-        </div>
       </div>
+
+      {/* New Project Modal */}
+      {showNewProjectModal && (
+         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+             <div className="bg-slate-900 w-full max-w-lg rounded-2xl border border-slate-800 shadow-2xl p-6">
+                <div className="flex justify-between items-center mb-6">
+                    <h2 className="text-xl font-bold text-white flex items-center">
+                        <FilePlus className="mr-2 text-primary" size={24}/> New Project
+                    </h2>
+                    <button onClick={() => setShowNewProjectModal(false)} className="text-slate-500 hover:text-white"><X size={20}/></button>
+                </div>
+                
+                <div className="space-y-4">
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Project Name</label>
+                        <input 
+                            type="text" 
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:border-primary focus:outline-none"
+                            placeholder="e.g. Westside Office Reno"
+                            value={newProjectName}
+                            onChange={e => setNewProjectName(e.target.value)}
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Address (Optional)</label>
+                        <input 
+                            type="text" 
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:border-primary focus:outline-none"
+                            placeholder="123 Builder Ln"
+                            value={newProjectAddress}
+                            onChange={e => setNewProjectAddress(e.target.value)}
+                        />
+                    </div>
+                    <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Use Template (Recommended)</label>
+                        <select 
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-white focus:border-primary focus:outline-none"
+                            value={selectedTemplateForProject}
+                            onChange={e => setSelectedTemplateForProject(e.target.value)}
+                        >
+                            <option value="">No Template (Blank Project)</option>
+                            {templates.map(t => (
+                                <option key={t.id} value={t.id}>{t.name}</option>
+                            ))}
+                        </select>
+                        <p className="text-xs text-slate-500 mt-2">Templates pre-load common items and scopes to speed up takeoff.</p>
+                    </div>
+                </div>
+
+                <div className="mt-8 flex justify-end space-x-3">
+                    <button onClick={() => setShowNewProjectModal(false)} className="px-4 py-2 text-slate-400 hover:text-white">Cancel</button>
+                    <button 
+                        onClick={handleCreateProject}
+                        disabled={!newProjectName}
+                        className="bg-primary text-slate-900 px-6 py-2 rounded-lg font-bold hover:bg-sky-400 disabled:opacity-50"
+                    >
+                        Create Project
+                    </button>
+                </div>
+             </div>
+         </div>
+      )}
 
       {/* Template Management Modal */}
       {showTemplateModal && (
