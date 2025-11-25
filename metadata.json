@@ -1,0 +1,7 @@
+{
+  "name": "Structura AI - Intelligent Construction Estimator",
+  "description": "A next-generation construction takeoff and estimating platform powered by Gemini models. Features automated plan analysis, real-time material pricing, visual generation, and site video insights.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
